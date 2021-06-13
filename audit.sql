@@ -92,7 +92,7 @@ BEGIN
     END IF;
     table_name = TG_ARGV[0];
     audit_row = ROW(
-        nextval('audit.'|| TG_ARGV[0] ||'_event_id_seq'), -- event_id
+        nextval('audit.'|| table_name ||'_event_id_seq'), -- event_id
         TG_TABLE_SCHEMA::text,                        -- schema_name
         TG_TABLE_NAME::text,                          -- table_name
         TG_RELID,                                     -- relation OID for much quicker searches
