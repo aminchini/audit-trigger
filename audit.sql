@@ -12,8 +12,6 @@
 --
 -- Should really be converted into a relocatable EXTENSION, with control and upgrade files.
 
-CREATE EXTENSION IF NOT EXISTS hstore;
-
 CREATE SCHEMA audit;
 REVOKE ALL ON SCHEMA audit FROM public;
 
@@ -29,8 +27,7 @@ COMMENT ON SCHEMA audit IS 'Out-of-table audit/history logging tables and trigge
 -- inserts.
 --
 -- Every index you add has a big impact too, so avoid adding indexes to the
--- audit table unless you REALLY need them. The hstore GIST indexes are
--- particularly expensive.
+-- audit table unless you REALLY need them.
 --
 -- It is sometimes worth copying the audit table, or a coarse subset of it that
 -- you're interested in, into a temporary table where you CREATE any useful
@@ -51,8 +48,8 @@ CREATE TABLE audit.logged_actions (
     client_port integer,
     client_query text,
     action TEXT NOT NULL CHECK (action IN ('I','D','U', 'T')),
-    row_data hstore,
-    changed_fields hstore,
+    row_data jsonb,
+    changed_fields jsonb,
     statement_only boolean not null
 );
 
@@ -86,16 +83,16 @@ DECLARE
     audit_row audit.logged_actions;
     include_values boolean;
     log_diffs boolean;
-    h_old hstore;
-    h_new hstore;
     excluded_cols text[] = ARRAY[]::text[];
+    table_name text;
+    _q_text text;
 BEGIN
     IF TG_WHEN <> 'AFTER' THEN
         RAISE EXCEPTION 'audit.if_modified_func() may only run as an AFTER trigger';
     END IF;
-
+    table_name = TG_ARGV[0];
     audit_row = ROW(
-        nextval('audit.logged_actions_event_id_seq'), -- event_id
+        nextval('audit.'|| table_name ||'_event_id_seq'), -- event_id
         TG_TABLE_SCHEMA::text,                        -- schema_name
         TG_TABLE_NAME::text,                          -- table_name
         TG_RELID,                                     -- relation OID for much quicker searches
@@ -107,38 +104,45 @@ BEGIN
         current_setting('application_name'),          -- client application
         inet_client_addr(),                           -- client_addr
         inet_client_port(),                           -- client_port
-        current_query(),                              -- top-level query or queries (if multistatement) from client
+        current_query(),                              -- top-level query or queries (if multi statement) from client
         substring(TG_OP,1,1),                         -- action
         NULL, NULL,                                   -- row_data, changed_fields
         'f'                                           -- statement_only
         );
 
-    IF NOT TG_ARGV[0]::boolean IS DISTINCT FROM 'f'::boolean THEN
+    IF NOT TG_ARGV[1]::boolean IS DISTINCT FROM 'f'::boolean THEN
         audit_row.client_query = NULL;
     END IF;
 
-    IF TG_ARGV[1] IS NOT NULL THEN
-        excluded_cols = TG_ARGV[1]::text[];
+    IF TG_ARGV[2] IS NOT NULL THEN
+        excluded_cols = TG_ARGV[2]::text[];
     END IF;
     
     IF (TG_OP = 'UPDATE' AND TG_LEVEL = 'ROW') THEN
-        audit_row.row_data = hstore(OLD.*) - excluded_cols;
-        audit_row.changed_fields =  (hstore(NEW.*) - audit_row.row_data) - excluded_cols;
-        IF audit_row.changed_fields = hstore('') THEN
+        audit_row.row_data = row_to_json(OLD.*)::jsonb #- excluded_cols;
+        SELECT jsonb_object_agg(DIFF.key, DIFF.value) #- excluded_cols 
+        FROM (
+            SELECT D.key, D.value FROM jsonb_each_text(row_to_json(NEW.*)::jsonb) D
+            EXCEPT
+            SELECT D.key, D.value FROM jsonb_each_text(audit_row.row_data::jsonb) D
+        ) DIFF
+        INTO audit_row.changed_fields;
+        IF audit_row.changed_fields = '{}'::jsonb THEN
             -- All changed fields are ignored. Skip this update.
             RETURN NULL;
         END IF;
     ELSIF (TG_OP = 'DELETE' AND TG_LEVEL = 'ROW') THEN
-        audit_row.row_data = hstore(OLD.*) - excluded_cols;
+        audit_row.row_data = row_to_json(OLD.*)::jsonb #- excluded_cols;
     ELSIF (TG_OP = 'INSERT' AND TG_LEVEL = 'ROW') THEN
-        audit_row.row_data = hstore(NEW.*) - excluded_cols;
+        audit_row.row_data = row_to_json(NEW.*)::jsonb #- excluded_cols;
     ELSIF (TG_LEVEL = 'STATEMENT' AND TG_OP IN ('INSERT','UPDATE','DELETE','TRUNCATE')) THEN
         audit_row.statement_only = 't';
     ELSE
         RAISE EXCEPTION '[audit.if_modified_func] - Trigger func added as trigger for unhandled case: %, %',TG_OP, TG_LEVEL;
         RETURN NULL;
     END IF;
-    INSERT INTO audit.logged_actions VALUES (audit_row.*);
+    _q_text = 'INSERT INTO audit.' || table_name || ' SELECT ($1).*;';
+    EXECUTE  _q_text using audit_row;
     RETURN NULL;
 END;
 $body$
@@ -178,9 +182,39 @@ cannot obtain the active role because it is reset by the SECURITY DEFINER invoca
 of the audit trigger its self.
 $body$;
 
+CREATE OR REPLACE FUNCTION audit.create_table(audit_table_name text) RETURNS void AS $body$
+DECLARE
+BEGIN
+
+    EXECUTE 'CREATE TABLE IF NOT EXISTS audit.' || audit_table_name || '(
+    event_id bigserial primary key,
+    schema_name text not null,
+    table_name text not null,
+    relid oid not null,
+    session_user_name text,
+    action_tstamp_tx TIMESTAMP WITH TIME ZONE NOT NULL,
+    action_tstamp_stm TIMESTAMP WITH TIME ZONE NOT NULL,
+    action_tstamp_clk TIMESTAMP WITH TIME ZONE NOT NULL,
+    transaction_id bigint,
+    application_name text,
+    client_addr inet,
+    client_port integer,
+    client_query text,
+    action TEXT NOT NULL CHECK (action IN (''I'',''D'',''U'', ''T'')),
+    row_data jsonb,
+    changed_fields jsonb,
+    statement_only boolean not null
+    );';
+    EXECUTE 'REVOKE ALL ON audit.' || audit_table_name || ' FROM public;';
+    EXECUTE 'CREATE INDEX IF NOT EXISTS ' || audit_table_name || '_relid_idx ON audit.' || audit_table_name || '(relid);';
+    EXECUTE 'CREATE INDEX IF NOT EXISTS ' || audit_table_name || '_action_tstamp_tx_stm_idx ON audit.' || audit_table_name || '(action_tstamp_stm);';
+    EXECUTE 'CREATE INDEX IF NOT EXISTS ' || audit_table_name || '_action_idx ON audit.' || audit_table_name || '(action);';
+END;
+$body$
+language 'plpgsql';
 
 
-CREATE OR REPLACE FUNCTION audit.audit_table(target_table regclass, audit_rows boolean, audit_query_text boolean, ignored_cols text[]) RETURNS void AS $body$
+CREATE OR REPLACE FUNCTION audit.audit_table(target_table regclass, audit_rows boolean, audit_query_text boolean, ignored_cols text[], audit_table_name text) RETURNS void AS $body$
 DECLARE
   stm_targets text = 'INSERT OR UPDATE OR DELETE OR TRUNCATE';
   _q_txt text;
@@ -189,13 +223,15 @@ BEGIN
     EXECUTE 'DROP TRIGGER IF EXISTS audit_trigger_row ON ' || target_table;
     EXECUTE 'DROP TRIGGER IF EXISTS audit_trigger_stm ON ' || target_table;
 
+    PERFORM audit.create_table(audit_table_name);
+
     IF audit_rows THEN
         IF array_length(ignored_cols,1) > 0 THEN
             _ignored_cols_snip = ', ' || quote_literal(ignored_cols);
         END IF;
         _q_txt = 'CREATE TRIGGER audit_trigger_row AFTER INSERT OR UPDATE OR DELETE ON ' || 
                  target_table || 
-                 ' FOR EACH ROW EXECUTE PROCEDURE audit.if_modified_func(' ||
+                 ' FOR EACH ROW EXECUTE PROCEDURE audit.if_modified_func(' || audit_table_name || ',' ||
                  quote_literal(audit_query_text) || _ignored_cols_snip || ');';
         RAISE NOTICE '%',_q_txt;
         EXECUTE _q_txt;
@@ -205,7 +241,7 @@ BEGIN
 
     _q_txt = 'CREATE TRIGGER audit_trigger_stm AFTER ' || stm_targets || ' ON ' ||
              target_table ||
-             ' FOR EACH STATEMENT EXECUTE PROCEDURE audit.if_modified_func('||
+             ' FOR EACH STATEMENT EXECUTE PROCEDURE audit.if_modified_func(' || audit_table_name || ',' ||
              quote_literal(audit_query_text) || ');';
     RAISE NOTICE '%',_q_txt;
     EXECUTE _q_txt;
@@ -225,6 +261,11 @@ Arguments:
 $body$;
 
 -- Pg doesn't allow variadic calls with 0 params, so provide a wrapper
+CREATE OR REPLACE FUNCTION audit.audit_table(target_table regclass, audit_rows boolean, audit_query_text boolean, ignored_cols text[]) RETURNS void AS $body$
+SELECT audit.audit_table($1, $2, $3, $4, 'logged_actions');
+$body$ LANGUAGE SQL;
+
+
 CREATE OR REPLACE FUNCTION audit.audit_table(target_table regclass, audit_rows boolean, audit_query_text boolean) RETURNS void AS $body$
 SELECT audit.audit_table($1, $2, $3, ARRAY[]::text[]);
 $body$ LANGUAGE SQL;
