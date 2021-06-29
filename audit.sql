@@ -127,7 +127,7 @@ BEGIN
             SELECT D.key, D.value FROM jsonb_each_text(audit_row.row_data::jsonb) D
         ) DIFF
         INTO audit_row.changed_fields;
-        IF audit_row.changed_fields IS NULL THEN
+        IF audit_row.changed_fields IS NULL OR audit_row.changed_fields = '{}'::jsonb THEN
             -- All changed fields are ignored. Skip this update.
             RETURN NULL;
         END IF;
@@ -282,11 +282,13 @@ Add auditing support to the given table. Row-level changes will be logged with f
 $body$;
 
 CREATE OR REPLACE VIEW audit.tableslist AS 
- SELECT DISTINCT triggers.trigger_schema AS schema,
-    triggers.event_object_table AS auditedtable
-   FROM information_schema.triggers
+    SELECT DISTINCT
+        triggers.trigger_schema AS schema,
+        triggers.event_object_table AS audited_table,
+        'audit.' || split_part(triggers.action_statement, '''', 2) AS logging_table
+    FROM information_schema.triggers
     WHERE triggers.trigger_name::text IN ('audit_trigger_row'::text, 'audit_trigger_stm'::text)  
-ORDER BY schema, auditedtable;
+    ORDER BY 1, 2, 3;
 
 COMMENT ON VIEW audit.tableslist IS $body$
 View showing all tables with auditing set up. Ordered by schema, then table.
