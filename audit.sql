@@ -127,7 +127,7 @@ BEGIN
             SELECT D.key, D.value FROM jsonb_each_text(audit_row.row_data::jsonb) D
         ) DIFF
         INTO audit_row.changed_fields;
-        IF audit_row.changed_fields = '{}'::jsonb THEN
+        IF audit_row.changed_fields IS NULL THEN
             -- All changed fields are ignored. Skip this update.
             RETURN NULL;
         END IF;
