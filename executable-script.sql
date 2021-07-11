@@ -26,6 +26,30 @@ CREATE INDEX default_table_relid_idx ON audit.default_table(relid);
 CREATE INDEX default_table_action_tstamp_tx_stm_idx ON audit.default_table(action_tstamp_stm);
 CREATE INDEX default_table_action_idx ON audit.default_table(action);
 
+CREATE OR REPLACE FUNCTION jsonb_remove_keys(
+	jdata JSONB,
+	keys TEXT[]
+)
+RETURNS JSONB AS $$
+DECLARE
+	result JSONB;
+	len INT;
+	target TEXT;
+BEGIN
+	len = array_length(keys, 1);
+	result = jdata;
+    IF len > 0 THEN
+        FOR i IN 1..len LOOP
+            target = keys[i];
+            IF (jdata ? target) THEN
+                result = (result - target);
+            END IF;
+        END LOOP;
+    END IF;
+	RETURN result;
+END;
+$$ LANGUAGE plpgsql;
+
 CREATE OR REPLACE FUNCTION audit.if_modified_func() RETURNS TRIGGER AS $body$
 DECLARE
     audit_row audit.default_table;
@@ -67,8 +91,8 @@ BEGIN
     END IF;
     
     IF (TG_OP = 'UPDATE' AND TG_LEVEL = 'ROW') THEN
-        audit_row.row_data = row_to_json(OLD.*)::jsonb - excluded_cols;
-        SELECT jsonb_object_agg(DIFF.key, DIFF.value) - excluded_cols 
+        audit_row.row_data = jsonb_remove_keys(row_to_json(OLD.*)::jsonb, excluded_cols);
+        SELECT jsonb_remove_keys(jsonb_object_agg(DIFF.key, DIFF.value), excluded_cols)
         FROM (
             SELECT D.key, D.value FROM jsonb_each_text(row_to_json(NEW.*)::jsonb) D
             EXCEPT
@@ -80,9 +104,9 @@ BEGIN
             RETURN NULL;
         END IF;
     ELSIF (TG_OP = 'DELETE' AND TG_LEVEL = 'ROW') THEN
-        audit_row.row_data = row_to_json(OLD.*)::jsonb #- excluded_cols;
+        audit_row.row_data = jsonb_remove_keys(row_to_json(OLD.*)::jsonb, excluded_cols);
     ELSIF (TG_OP = 'INSERT' AND TG_LEVEL = 'ROW') THEN
-        audit_row.row_data = row_to_json(NEW.*)::jsonb #- excluded_cols;
+        audit_row.row_data = jsonb_remove_keys(row_to_json(NEW.*)::jsonb, excluded_cols);
     ELSIF (TG_LEVEL = 'STATEMENT' AND TG_OP IN ('INSERT','UPDATE','DELETE','TRUNCATE')) THEN
         audit_row.statement_only = 't';
     ELSE
