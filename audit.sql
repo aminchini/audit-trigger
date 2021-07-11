@@ -33,7 +33,7 @@ COMMENT ON SCHEMA audit IS 'Out-of-table audit/history logging tables and trigge
 -- you're interested in, into a temporary table where you CREATE any useful
 -- indexes and do your analysis.
 --
-CREATE TABLE audit.logged_actions (
+CREATE TABLE audit.default_table (
     event_id bigserial primary key,
     schema_name text not null,
     table_name text not null,
@@ -53,7 +53,7 @@ CREATE TABLE audit.logged_actions (
     statement_only boolean not null
 );
 
-REVOKE ALL ON audit.logged_actions FROM public;
+REVOKE ALL ON audit.default_table FROM public;
 
 COMMENT ON TABLE audit.logged_actions IS 'History of auditable actions on audited tables, from audit.if_modified_func()';
 COMMENT ON COLUMN audit.logged_actions.event_id IS 'Unique identifier for each auditable event';
@@ -74,13 +74,13 @@ COMMENT ON COLUMN audit.logged_actions.row_data IS 'Record value. Null for state
 COMMENT ON COLUMN audit.logged_actions.changed_fields IS 'New values of fields changed by UPDATE. Null except for row-level UPDATE events.';
 COMMENT ON COLUMN audit.logged_actions.statement_only IS '''t'' if audit event is from an FOR EACH STATEMENT trigger, ''f'' for FOR EACH ROW';
 
-CREATE INDEX logged_actions_relid_idx ON audit.logged_actions(relid);
-CREATE INDEX logged_actions_action_tstamp_tx_stm_idx ON audit.logged_actions(action_tstamp_stm);
-CREATE INDEX logged_actions_action_idx ON audit.logged_actions(action);
+CREATE INDEX default_table_relid_idx ON audit.default_table(relid);
+CREATE INDEX default_table_action_tstamp_tx_stm_idx ON audit.default_table(action_tstamp_stm);
+CREATE INDEX default_table_action_idx ON audit.default_table(action);
 
 CREATE OR REPLACE FUNCTION audit.if_modified_func() RETURNS TRIGGER AS $body$
 DECLARE
-    audit_row audit.logged_actions;
+    audit_row audit.default_table;
     include_values boolean;
     log_diffs boolean;
     excluded_cols text[] = ARRAY[]::text[];
@@ -119,12 +119,12 @@ BEGIN
     END IF;
     
     IF (TG_OP = 'UPDATE' AND TG_LEVEL = 'ROW') THEN
-        audit_row.row_data = row_to_json(OLD.*)::jsonb #- excluded_cols;
-        SELECT jsonb_object_agg(DIFF.key, DIFF.value) #- excluded_cols 
+        audit_row.row_data = row_to_json(OLD.*)::jsonb - excluded_cols;
+        SELECT jsonb_object_agg(DIFF.key, DIFF.value) - excluded_cols 
         FROM (
             SELECT D.key, D.value FROM jsonb_each_text(row_to_json(NEW.*)::jsonb) D
             EXCEPT
-            SELECT D.key, D.value FROM jsonb_each_text(audit_row.row_data::jsonb) D
+            SELECT D.key, D.value FROM jsonb_each_text(row_to_json(OLD.*)::jsonb) D
         ) DIFF
         INTO audit_row.changed_fields;
         IF audit_row.changed_fields IS NULL OR audit_row.changed_fields = '{}'::jsonb THEN
@@ -231,7 +231,7 @@ BEGIN
         END IF;
         _q_txt = 'CREATE TRIGGER audit_trigger_row AFTER INSERT OR UPDATE OR DELETE ON ' || 
                  target_table || 
-                 ' FOR EACH ROW EXECUTE PROCEDURE audit.if_modified_func(' || audit_table_name || ',' ||
+                 ' FOR EACH ROW EXECUTE PROCEDURE audit.if_modified_func(' || quote_literal(audit_table_name) || ', ' ||
                  quote_literal(audit_query_text) || _ignored_cols_snip || ');';
         RAISE NOTICE '%',_q_txt;
         EXECUTE _q_txt;
@@ -241,7 +241,7 @@ BEGIN
 
     _q_txt = 'CREATE TRIGGER audit_trigger_stm AFTER ' || stm_targets || ' ON ' ||
              target_table ||
-             ' FOR EACH STATEMENT EXECUTE PROCEDURE audit.if_modified_func(' || audit_table_name || ',' ||
+             ' FOR EACH STATEMENT EXECUTE PROCEDURE audit.if_modified_func(' || quote_literal(audit_table_name) || ',' ||
              quote_literal(audit_query_text) || ');';
     RAISE NOTICE '%',_q_txt;
     EXECUTE _q_txt;
@@ -262,13 +262,12 @@ $body$;
 
 -- Pg doesn't allow variadic calls with 0 params, so provide a wrapper
 CREATE OR REPLACE FUNCTION audit.audit_table(target_table regclass, audit_rows boolean, audit_query_text boolean, ignored_cols text[]) RETURNS void AS $body$
-SELECT audit.audit_table($1, $2, $3, $4, 'logged_actions');
-$body$ LANGUAGE SQL;
-
+SELECT audit.audit_table($1, $2, $3, $4, 'default_table');
+$body$ LANGUAGE 'sql';
 
 CREATE OR REPLACE FUNCTION audit.audit_table(target_table regclass, audit_rows boolean, audit_query_text boolean) RETURNS void AS $body$
 SELECT audit.audit_table($1, $2, $3, ARRAY[]::text[]);
-$body$ LANGUAGE SQL;
+$body$ LANGUAGE 'sql';
 
 -- And provide a convenience call wrapper for the simplest case
 -- of row-level logging with no excluded cols and query logging enabled.

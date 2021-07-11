@@ -67,12 +67,12 @@ BEGIN
     END IF;
     
     IF (TG_OP = 'UPDATE' AND TG_LEVEL = 'ROW') THEN
-        audit_row.row_data = row_to_json(OLD.*)::jsonb #- excluded_cols;
-        SELECT jsonb_object_agg(DIFF.key, DIFF.value) #- excluded_cols 
+        audit_row.row_data = row_to_json(OLD.*)::jsonb - excluded_cols;
+        SELECT jsonb_object_agg(DIFF.key, DIFF.value) - excluded_cols 
         FROM (
             SELECT D.key, D.value FROM jsonb_each_text(row_to_json(NEW.*)::jsonb) D
             EXCEPT
-            SELECT D.key, D.value FROM jsonb_each_text(audit_row.row_data::jsonb) D
+            SELECT D.key, D.value FROM jsonb_each_text(row_to_json(OLD.*)::jsonb) D
         ) DIFF
         INTO audit_row.changed_fields;
         IF audit_row.changed_fields IS NULL OR audit_row.changed_fields = '{}'::jsonb THEN
